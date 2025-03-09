@@ -1,0 +1,13 @@
+[package]
+name = "server"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+clap = "4.5.31"
+serde = "1.0.218"
+toml = "0.8.20"
+mio = { version = "1.0.3", features = ["os-poll", "os-ext", "net"] }
+anyhow = "1.0.97"
+proto = { path = "../proto" }
+mlua = { version = "0.10.3", features = ["lua54", "vendored"] }
