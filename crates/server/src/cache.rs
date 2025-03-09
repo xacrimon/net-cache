@@ -38,8 +38,9 @@ impl Cache {
     }
 
     pub fn expired(&mut self, now: Instant) -> impl Iterator<Item = (Key, Vec<ClientId>)> + '_ {
-        self.expiries
-            .drain_expired(now)
-            .map(|key| self.tracked.remove_entry(&key).unwrap())
+        self.expiries.drain_expired(now).map(|key| {
+            let clients = self.tracked.remove(&key).unwrap_or_default();
+            (key, clients)
+        })
     }
 }
