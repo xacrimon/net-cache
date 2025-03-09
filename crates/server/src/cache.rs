@@ -1,8 +1,8 @@
 use crate::ClientId;
+use crate::ttl::{Tracker, TtlKey};
 use std::collections::HashMap;
 use std::rc::Rc;
 use std::time::Instant;
-use std::collections::VecDeque;
 
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Key {
@@ -19,11 +19,12 @@ impl Key {
 
 pub struct Value {
     value: Vec<u8>,
+    ttl: Option<TtlKey>,
 }
 
 pub struct Cache {
     items: HashMap<Key, Value>,
-    expiries: VecDeque<(Key, Instant)>,
+    expiries: Tracker,
     tracked: HashMap<Key, Vec<ClientId>>,
 }
 
@@ -31,46 +32,14 @@ impl Cache {
     pub fn new() -> Self {
         Self {
             items: HashMap::new(),
-            expiries: VecDeque::new(),
+            expiries: Tracker::new(),
             tracked: HashMap::new(),
         }
     }
 
-    fn add_expiry(&mut self, key: Key, expires_at: Instant) {
-        let idx = self.search_expiries_by_time(expires_at);
-        debug_assert!(self.expiries.iter().find(|(k, _)| k == &key).is_none());
-        self.expiries.insert(idx, (key, expires_at));
-    }
-
-    fn update_expiry(&mut self, key: &Key, expires_at: Instant) {
-        let idx = self.search_expiries_by_key(key).unwrap();
-        let (_, time) = &mut self.expiries[idx];
-        *time = expires_at;
-    }
-
-    fn remove__expiry(&mut self, key: &Key) {
-        let idx = self.search_expiries_by_key(key).unwrap();
-        self.expiries.remove(idx);
-    }
-
-    fn search_expiries_by_key(&mut self, key:&Key) -> Option<usize> {
-        self.expiries.iter_mut().position(|(k, _)| k == key)
-    }
-
-    fn search_expiries_by_time(&self, needle: Instant) -> usize {
-        match self.expiries.binary_search_by_key(&needle,|(_, expires_at)| *expires_at) {
-            Ok(idx) => idx,
-            Err(idx) => idx,
-        }
-    }
-
-    pub fn expired(&mut self) -> impl Iterator<Item = (Key, Vec<ClientId>)> + '_ {
-        let now  = Instant::now();
-        let top = self.search_expiries_by_time(now);
-
-        self.expiries.drain(0..top).map(|(key, _)| {
-            let clients = self.tracked.remove(&key).unwrap();
-            (key, clients)
-        })
+    pub fn expired(&mut self, now: Instant) -> impl Iterator<Item = (Key, Vec<ClientId>)> + '_ {
+        self.expiries
+            .drain_expired(now)
+            .map(|key| self.tracked.remove_entry(&key).unwrap())
     }
 }

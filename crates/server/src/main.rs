@@ -1,13 +1,14 @@
 mod cache;
 mod config;
+mod ttl;
 
 use anyhow::Result;
 use anyhow::bail;
-use mio::unix::pipe;
 use mio::Registry;
 use mio::Token;
 use mio::event::Event;
 use mio::net::{TcpListener, TcpStream};
+use mio::unix::pipe;
 use mio::{Events, Interest, Poll};
 use proto::Request;
 use std::cmp;
