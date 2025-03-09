@@ -1,0 +1,10 @@
+[package]
+name = "transport"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+mio = { version = "1.0.3", features = ["os-poll", "os-ext", "net"] }
+proto = { path = "../proto" }
+quiche = "0.23.4"
+anyhow = "1.0.97"

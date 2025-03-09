@@ -10,5 +10,8 @@ toml = "0.8.20"
 mio = { version = "1.0.3", features = ["os-poll", "os-ext", "net"] }
 anyhow = "1.0.97"
 proto = { path = "../proto" }
+transport = { path = "../transport" }
 mlua = { version = "0.10.3", features = ["lua54", "vendored"] }
 slab = "0.4.9"
+foldhash = "0.1.4"
+tracing-subscriber = "0.3.19"

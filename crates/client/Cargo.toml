@@ -1,0 +1,9 @@
+[package]
+name = "client"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+quiche = "0.23.4"
+anyhow = "1.0.97"
+tracing-subscriber = "0.3.19"

@@ -1,6 +1,5 @@
 use crate::cache::Key;
 use slab::Slab;
-use std::iter;
 use std::sync::LazyLock;
 use std::{collections::BTreeMap, num::NonZeroUsize, time::Instant};
 

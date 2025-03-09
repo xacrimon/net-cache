@@ -2,5 +2,7 @@
 resolver = "3"
 members = [
     "crates/proto",
+    "crates/transport",
     "crates/server",
+    "crates/client",
 ]
