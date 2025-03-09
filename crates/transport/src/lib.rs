@@ -121,7 +121,6 @@ impl NeQuServer {
             local,
             peer,
             recv_buf,
-            send_buf: Vec::new(),
             last_sent_keepalive: Instant::now(),
             last_received_keepalive: Instant::now(),
             next_stream_id: CLIENT_STREAM_ID_START,
@@ -143,7 +142,6 @@ pub struct NeQuTransport {
     local: SocketAddr,
     peer: SocketAddr,
     recv_buf: Vec<u8>,
-    send_buf: Vec<u8>,
     last_sent_keepalive: Instant,
     last_received_keepalive: Instant,
     next_stream_id: u64,
@@ -164,7 +162,6 @@ impl NeQuTransport {
             local,
             peer,
             recv_buf: Vec::new(),
-            send_buf: Vec::new(),
             last_sent_keepalive: Instant::now(),
             last_received_keepalive: Instant::now(),
             next_stream_id: CLIENT_STREAM_ID_START,
@@ -243,21 +240,24 @@ impl NeQuTransport {
         Ok(())
     }
 
-    fn prep_send_buf(&mut self) -> Result<SendStatus> {
-        if !self.send_buf.is_empty() {
-            return Ok(SendStatus::NotDone);
-        }
+    // call when:
+    // - after recv
+    // - after on_timeout
+    // - stream_send/stream_shutdown etc
+    // - stream_recv etc
+    pub fn drive_send(&mut self) -> Result<Option<(Vec<u8>, quiche::SendInfo)>> {
+        let max_size = self.conn.max_send_udp_payload_size();
+        let mut buf = vec![0; max_size];
 
-        self.send_buf.resize(IOBUF_SIZE, 0);
-
-        let (n, info) = match self.conn.send(&mut self.send_buf) {
+        let (n, info) = match self.conn.send(&mut buf) {
             Ok((n, info)) => (n, info),
             Err(quiche::Error::Done) => {
-                self.send_buf.clear();
-                return Ok(SendStatus::Done);
+                return Ok(None);
             }
             Err(err) => bail!(err),
         };
+
+        buf.truncate(n);
 
         let now = std::time::Instant::now();
         if now > info.at {
@@ -271,33 +271,9 @@ impl NeQuTransport {
                 (info.at - now).as_micros()
             );
         }
+        debug!("serialized packet with {} bytes", n);
 
-        self.send_buf.truncate(n);
-        Ok(SendStatus::NotDone)
-    }
-
-    // call when:
-    // - after recv
-    // - after on_timeout
-    // - stream_send/stream_shutdown etc
-    // - stream_recv etc
-    pub fn drive_send(&mut self, socket: &UdpSocket) -> Result<SendStatus> {
-        match self.prep_send_buf() {
-            Ok(SendStatus::Done) => return Ok(SendStatus::Done),
-            Ok(SendStatus::NotDone) => (),
-            Ok(SendStatus::WouldBlock) => unreachable!(),
-            Err(err) => bail!(err),
-        }
-
-        let n = match socket.send_to(&self.send_buf[..], self.peer) {
-            Ok(n) => n,
-            Err(ref err) if interrupted(err) => return self.drive_send(socket),
-            Err(ref err) if would_block(err) => return Ok(SendStatus::WouldBlock),
-            Err(err) => bail!(err),
-        };
-
-        self.send_buf.drain(..n);
-        Ok(SendStatus::NotDone)
+        Ok(Some((buf, info)))
     }
 
     pub fn next_timeout(&self) -> Option<Instant> {

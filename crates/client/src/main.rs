@@ -1,3 +1,5 @@
+use std::time::Instant;
+
 use transport::{IOBUF_SIZE, SendStatus};
 
 use anyhow::Result;
@@ -50,27 +52,24 @@ fn main() -> Result<()> {
         }
 
         if let Some(timeout) = timeout.take() {
-            let now = std::time::Instant::now();
-            if timeout <= now {
+            if timeout <= Instant::now() {
                 transport.on_timeout();
             }
         }
 
-        loop {
-            match transport.drive_send(&socket)? {
-                SendStatus::Done => {
-                    timeout = transport.next_timeout();
-                    break;
-                }
-                SendStatus::NotDone => {
-                    continue;
-                }
-                SendStatus::WouldBlock => {
-                    println!("send would block");
-                    break;
+        while let Some((buf, info)) = transport.drive_send()? {
+            'packet: loop {
+                match socket.send_to(&buf, info.to) {
+                    Ok(n) if n == buf.len() => break 'packet,
+                    Ok(n) => panic!("short write: {} < {}", n, buf.len()),
+                    Err(ref err) if transport::interrupted(err) => continue,
+                    Err(ref err) if transport::would_block(err) => break,
+                    Err(err) => anyhow::bail!(err),
                 }
             }
         }
+
+        timeout = transport.next_timeout();
     }
 
     Ok(())

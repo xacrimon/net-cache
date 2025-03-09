@@ -4,6 +4,7 @@ mod ttl;
 
 use anyhow::Result;
 use anyhow::bail;
+use core::panic;
 use mio::Token;
 use mio::event::Event;
 use mio::{Events, Interest, Poll};
@@ -15,18 +16,21 @@ use std::mem;
 use std::net::SocketAddr;
 use std::num::NonZeroUsize;
 use std::time::Duration;
+use std::time::Instant;
 use tracing_subscriber::filter::LevelFilter;
 use transport::IOBUF_SIZE;
 use transport::NeQuServer;
 use transport::NeQuTransport;
 use transport::SendStatus;
+use transport::interrupted;
+use transport::would_block;
 
 const LISTEN_ADDR: &str = "127.0.0.1:6479";
 const SERVER: Token = Token(0);
 const POLL_CAPACITY: usize = 128;
 const POLL_TIMEOUT: Duration = Duration::from_millis(100);
 
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 struct ClientId(NonZeroUsize);
 
 impl ClientId {
@@ -39,12 +43,17 @@ impl ClientId {
     }
 }
 
+pub struct Packet {
+    pub buf: Vec<u8>,
+    pub client: ClientId,
+    pub pace: Instant,
+}
+
 struct State {
     clients: Slab<NeQuTransport>,
     peers: HashMap<SocketAddr, ClientId>,
-    write_queue: HashSet<SocketAddr>,
+    send_queue: Vec<Packet>,
     timeouts: Vec<(std::time::Instant, SocketAddr)>,
-    writable: bool,
 }
 
 impl State {
@@ -52,9 +61,8 @@ impl State {
         Self {
             clients: Slab::new(),
             peers: HashMap::new(),
-            write_queue: HashSet::new(),
+            send_queue: Vec::new(),
             timeouts: Vec::new(),
-            writable: false,
         }
     }
 
@@ -91,7 +99,7 @@ impl State {
         let client = self.clients.remove(key);
         let peer = client.peer();
         self.peers.remove(&peer);
-        self.write_queue.remove(&peer);
+        self.send_queue.retain(|p| p.client != id);
         self.timeouts.retain(|(_, p)| *p != peer);
     }
 
@@ -114,11 +122,39 @@ impl State {
         Ok(updated)
     }
 
-    fn ingest_buffers(&mut self, clients: HashSet<SocketAddr>) -> Result<()> {
+    fn packet_batch(id: ClientId, client: &mut NeQuTransport) -> Result<Vec<Packet>> {
+        let mut batch = Vec::new();
+        while let Some((buf, info)) = client.drive_send()? {
+            let packet = Packet {
+                buf,
+                client: id,
+                pace: info.at,
+            };
+            batch.push(packet);
+        }
+
+        Ok(batch)
+    }
+
+    fn drive_clients(&mut self, clients: HashSet<SocketAddr>) -> Result<()> {
         for addr in clients {
+            let id = self.peers[&addr];
             let client = self.client_for_peer(addr);
             client.drive_recv()?;
-            self.write_queue.insert(addr);
+
+            let batch = Self::packet_batch(id, client)?;
+
+            let timeout = client.next_timeout();
+            if let Some(timeout) = timeout {
+                let idx = self
+                    .timeouts
+                    .binary_search_by(|(t, _)| t.cmp(&timeout))
+                    .map_or_else(|x| x, |x| x);
+
+                self.timeouts.insert(idx, (timeout, addr));
+            }
+
+            self.send_queue.extend(batch);
         }
 
         Ok(())
@@ -131,44 +167,30 @@ impl State {
             }
 
             let (timeout, peer) = self.timeouts.remove(0);
+            let id = self.peers[&peer];
             let client = self.client_for_peer(peer);
             client.on_timeout();
-            self.write_queue.insert(peer);
+
+            let batch = Self::packet_batch(id, client)?;
+            self.send_queue.extend(batch);
         }
 
         Ok(())
     }
 
     fn send_queued(&mut self, server: &mut NeQuServer) -> Result<()> {
-        loop {
-            if !self.writable {
-                break;
-            }
+        while self.send_queue.len() > 0 {
+            let packet = &self.send_queue[0];
+            let peer = self.clients[packet.client.to_slab_key()].peer();
 
-            let peer = match self.write_queue.iter().next() {
-                Some(peer) => *peer,
-                None => return Ok(()),
-            };
-
-            let client = self.client_for_peer(peer);
-
-            match client.drive_send(server.socket())? {
-                SendStatus::Done => {
-                    let timeout = client.next_timeout();
-                    self.write_queue.remove(&peer);
-
-                    if let Some(timeout) = timeout {
-                        let idx = self
-                            .timeouts
-                            .binary_search_by(|(t, _)| t.cmp(&timeout))
-                            .map_or_else(|x| x, |x| x);
-
-                        self.timeouts.insert(idx, (timeout, peer));
-                    }
+            match server.socket().send_to(&packet.buf, peer) {
+                Ok(n) if n == packet.buf.len() => {
+                    self.send_queue.remove(0);
                 }
-
-                SendStatus::NotDone => continue,
-                SendStatus::WouldBlock => self.writable = false,
+                Ok(n) => panic!("short write: {} < {}", n, packet.buf.len()),
+                Err(ref err) if interrupted(err) => continue,
+                Err(ref err) if would_block(err) => break,
+                Err(err) => bail!(err),
             }
         }
 
@@ -177,13 +199,12 @@ impl State {
 
     fn handle_socket_event(&mut self, server: &mut NeQuServer, event: &Event) -> Result<()> {
         if event.is_writable() {
-            self.writable = true;
+            self.send_queued(server)?;
         }
 
         if event.is_readable() {
             let updated = self.socket_recv_available(server)?;
-            self.ingest_buffers(updated)?;
-            self.send_queued(server)?;
+            self.drive_clients(updated)?;
         }
 
         Ok(())
@@ -215,6 +236,10 @@ impl State {
         }
 
         self.check_timeouts()?;
+
+        let peers = self.peers.keys().copied().collect();
+        self.drive_clients(peers)?;
+
         self.send_queued(server)?;
         Ok(())
     }
