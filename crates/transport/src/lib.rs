@@ -2,35 +2,93 @@ use anyhow::{Result, bail};
 use mio::net::UdpSocket;
 use std::io;
 use std::net::SocketAddr;
-use std::time::Duration;
+use std::time::{Duration, Instant};
+use tracing::{debug, trace};
 
-use mio::net::{TcpListener, TcpStream};
+pub const IOBUF_SIZE: usize = 65536;
+
+const KEEPALIVE_INTERVAL: Duration = Duration::from_millis(1000);
+const KEEPALIVE_TIMEOUT: Duration = Duration::from_millis(5000);
+const KEEPALIVE_STREAM: u64 = 0;
+const KEEPALIVE_MESSAGE: &[u8] = b"0xdeadbeef";
+
+const MAX_STREAMS: u64 = 1024;
+const STREAM_BUFFER: u64 = 65536;
+const CONNECTION_BUFFER: u64 = 4194304;
+
+const CLIENT_STREAM_ID_START: u64 = 8;
 
 static SERVER_ID: quiche::ConnectionId = quiche::ConnectionId::from_ref(&[0; 16]);
-static ALPN_LIST: &[&[u8]] = &[b"nequ/1.0"];
+static ALPN: &[&[u8]] = &[b"nequ/1.0"];
 
-fn would_block(err: &io::Error) -> bool {
+#[repr(u64)]
+enum Priority {
+    Critical = 7,
+    Default = 127,
+}
+
+pub fn connection_id_from_addrs(
+    local: SocketAddr,
+    peer: SocketAddr,
+) -> quiche::ConnectionId<'static> {
+    use std::hash::{Hash, Hasher};
+
+    let mut hasher = fnv::FnvHasher::default();
+    local.hash(&mut hasher);
+    peer.hash(&mut hasher);
+    let hash = hasher.finish();
+
+    let id = Vec::from(hash.to_be_bytes());
+    quiche::ConnectionId::from_vec(id)
+}
+
+fn quiche_server_config() -> Result<quiche::Config> {
+    let mut config = quiche::Config::new(quiche::PROTOCOL_VERSION)?;
+
+    config.load_cert_chain_from_pem_file("certificate.pem")?;
+    config.load_priv_key_from_pem_file("key.pem")?;
+
+    config.set_application_protos(ALPN)?;
+
+    config.set_initial_max_streams_bidi(MAX_STREAMS);
+    config.set_initial_max_streams_uni(MAX_STREAMS);
+    config.set_initial_max_data(CONNECTION_BUFFER);
+    config.set_initial_max_stream_data_bidi_local(STREAM_BUFFER);
+    config.set_initial_max_stream_data_bidi_remote(STREAM_BUFFER);
+    config.set_initial_max_stream_data_uni(STREAM_BUFFER);
+
+    Ok(config)
+}
+
+fn quiche_client_config() -> Result<quiche::Config> {
+    let mut config = quiche::Config::new(quiche::PROTOCOL_VERSION)?;
+
+    config.set_application_protos(ALPN)?;
+
+    config.set_initial_max_streams_bidi(MAX_STREAMS);
+    config.set_initial_max_streams_uni(MAX_STREAMS);
+    config.set_initial_max_data(CONNECTION_BUFFER);
+    config.set_initial_max_stream_data_bidi_local(STREAM_BUFFER);
+    config.set_initial_max_stream_data_bidi_remote(STREAM_BUFFER);
+    config.set_initial_max_stream_data_uni(STREAM_BUFFER);
+
+    Ok(config)
+}
+
+pub fn would_block(err: &io::Error) -> bool {
     err.kind() == io::ErrorKind::WouldBlock
 }
 
-fn would_block_anyhow(err: &anyhow::Error) -> bool {
+pub fn would_block_anyhow(err: &anyhow::Error) -> bool {
     err.downcast_ref::<io::Error>().map_or(false, would_block)
 }
 
-fn interrupted(err: &io::Error) -> bool {
+pub fn interrupted(err: &io::Error) -> bool {
     err.kind() == io::ErrorKind::Interrupted
 }
 
-fn interrupted_anyhow(err: &anyhow::Error) -> bool {
+pub fn interrupted_anyhow(err: &anyhow::Error) -> bool {
     err.downcast_ref::<io::Error>().map_or(false, interrupted)
-}
-
-pub struct RedisTcpServer {
-    listener: TcpListener,
-}
-
-pub struct RedisTcpTransport {
-    stream: TcpStream,
 }
 
 pub struct NeQuServer {
@@ -41,25 +99,17 @@ pub struct NeQuServer {
 impl NeQuServer {
     pub fn bind(addr: SocketAddr) -> Result<Self> {
         let socket = UdpSocket::bind(addr)?;
-
-        let mut config = quiche::Config::new(quiche::PROTOCOL_VERSION)?;
-        config.verify_peer(false);
-        config.set_application_protos(ALPN_LIST)?;
-        config
-            .load_cert_chain_from_pem_file("certificate.pem")
-            .unwrap();
-        config.load_priv_key_from_pem_file("key.pem").unwrap();
-
+        let config = quiche_server_config()?;
         Ok(Self { socket, config })
     }
 
-    pub fn event_source(&mut self) -> &mut dyn mio::event::Source {
-        &mut self.socket
-    }
-
-    pub fn poll_read(&mut self, buf: &mut [u8]) -> Result<(usize, SocketAddr)> {
-        let (len, addr) = self.socket.recv_from(buf)?;
-        Ok((len, addr))
+    pub fn read_packets(&mut self, buf: &mut [u8]) -> Result<Option<(usize, SocketAddr)>> {
+        match self.socket.recv_from(buf) {
+            Ok((n, addr)) => Ok(Some((n, addr))),
+            Err(ref err) if interrupted(err) => return self.read_packets(buf),
+            Err(ref err) if would_block(err) => Ok(None),
+            Err(err) => bail!(err),
+        }
     }
 
     pub fn accept(&mut self, recv_buf: Vec<u8>, peer: SocketAddr) -> Result<NeQuTransport> {
@@ -72,7 +122,19 @@ impl NeQuServer {
             peer,
             recv_buf,
             send_buf: Vec::new(),
+            last_sent_keepalive: Instant::now(),
+            last_received_keepalive: Instant::now(),
+            next_stream_id: CLIENT_STREAM_ID_START,
+            is_server: true,
         })
+    }
+
+    pub fn socket(&self) -> &UdpSocket {
+        &self.socket
+    }
+
+    pub fn socket_mut(&mut self) -> &mut UdpSocket {
+        &mut self.socket
     }
 }
 
@@ -82,13 +144,72 @@ pub struct NeQuTransport {
     peer: SocketAddr,
     recv_buf: Vec<u8>,
     send_buf: Vec<u8>,
+    last_sent_keepalive: Instant,
+    last_received_keepalive: Instant,
+    next_stream_id: u64,
+    is_server: bool,
 }
 
 impl NeQuTransport {
+    pub fn connect(
+        local: SocketAddr,
+        peer: SocketAddr,
+        scid: &quiche::ConnectionId,
+    ) -> Result<Self> {
+        let mut config = quiche_client_config()?;
+        let conn = quiche::connect(None, &scid, local, peer, &mut config)?;
+
+        Ok(Self {
+            conn,
+            local,
+            peer,
+            recv_buf: Vec::new(),
+            send_buf: Vec::new(),
+            last_sent_keepalive: Instant::now(),
+            last_received_keepalive: Instant::now(),
+            next_stream_id: CLIENT_STREAM_ID_START,
+            is_server: false,
+        })
+    }
+
+    pub fn new_stream(&mut self, priority: Priority) -> Result<u64> {
+        let stream_id = self.next_stream_id;
+        self.next_stream_id += 2;
+        Ok(stream_id)
+    }
+
+    pub fn close_stream(&mut self, stream_id: u64) -> Result<()> {
+        self.conn
+            .stream_shutdown(stream_id, quiche::Shutdown::Write, 0)?;
+        Ok(())
+    }
+
+    pub fn stream_send(&mut self, stream_id: u64, buf: &[u8]) -> Result<usize> {
+        let n = self.conn.stream_send(stream_id, buf, false)?;
+        Ok(n)
+    }
+
+    pub fn stream_recv(&mut self, stream_id: u64, buf: &mut [u8]) -> Result<usize> {
+        let n = match self.conn.stream_recv(stream_id, buf) {
+            Ok((n, _)) => n,
+            Err(quiche::Error::Done) => 0,
+            Err(err) => bail!(err),
+        };
+
+        Ok(n)
+    }
+
+    pub fn readable_streams(&self) -> impl Iterator<Item = u64> {
+        self.conn.writable()
+    }
+
+    pub fn writable_streams(&self) -> impl Iterator<Item = u64> {
+        self.conn.writable()
+    }
+
     pub fn recv_packet(&mut self, buf: &[u8]) -> Result<()> {
         self.recv_buf.extend_from_slice(buf);
-
-        if self.recv_buf.len() < 4096 {
+        if self.recv_buf.len() < IOBUF_SIZE {
             return Ok(());
         }
 
@@ -97,23 +218,62 @@ impl NeQuTransport {
     }
 
     pub fn drive_recv(&mut self) -> Result<()> {
+        if self.recv_buf.is_empty() {
+            return Ok(());
+        }
+
         let recv_info = quiche::RecvInfo {
             from: self.peer,
             to: self.local,
         };
 
-        if self.recv_buf.is_empty() {
-            return Ok(());
-        }
-
         let buf = &mut self.recv_buf[..];
+        let established = self.conn.is_established();
         let read = match self.conn.recv(buf, recv_info) {
             Ok(n) => n,
             Err(err) => bail!(err),
         };
 
+        if self.conn.is_established() != established {
+            debug!("connection established");
+            self.configure()?;
+        }
+
         self.recv_buf.drain(..read);
         Ok(())
+    }
+
+    fn prep_send_buf(&mut self) -> Result<SendStatus> {
+        if !self.send_buf.is_empty() {
+            return Ok(SendStatus::NotDone);
+        }
+
+        self.send_buf.resize(IOBUF_SIZE, 0);
+
+        let (n, info) = match self.conn.send(&mut self.send_buf) {
+            Ok((n, info)) => (n, info),
+            Err(quiche::Error::Done) => {
+                self.send_buf.clear();
+                return Ok(SendStatus::Done);
+            }
+            Err(err) => bail!(err),
+        };
+
+        let now = std::time::Instant::now();
+        if now > info.at {
+            trace!(
+                "received pace {} us in the past",
+                (now - info.at).as_micros()
+            );
+        } else {
+            trace!(
+                "received pace {} us into the future",
+                (info.at - now).as_micros()
+            );
+        }
+
+        self.send_buf.truncate(n);
+        Ok(SendStatus::NotDone)
     }
 
     // call when:
@@ -121,63 +281,118 @@ impl NeQuTransport {
     // - after on_timeout
     // - stream_send/stream_shutdown etc
     // - stream_recv etc
-    pub fn try_drive_send(&mut self, server: &mut NeQuServer) -> Result<SendStatus> {
-        if self.send_buf.is_empty() {
-            self.send_buf.extend_from_slice(&[0; 4096]);
-
-            let (write, info) = match self.conn.send(&mut self.send_buf) {
-                Ok((n, info)) => (n, info),
-                Err(quiche::Error::Done) => {
-                    return Ok(SendStatus::Done {
-                        timeout: self.conn.timeout(),
-                    });
-                }
-                Err(err) => bail!(err),
-            };
-
-            let now = std::time::Instant::now();
-            if now > info.at {
-                println!(
-                    "received pace {} ns in the past",
-                    (now - info.at).as_nanos()
-                );
-            } else {
-                println!(
-                    "received pace {} ns into the future",
-                    (info.at - now).as_nanos()
-                );
-            }
-
-            self.send_buf.truncate(write);
+    pub fn drive_send(&mut self, socket: &UdpSocket) -> Result<SendStatus> {
+        match self.prep_send_buf() {
+            Ok(SendStatus::Done) => return Ok(SendStatus::Done),
+            Ok(SendStatus::NotDone) => (),
+            Ok(SendStatus::WouldBlock) => unreachable!(),
+            Err(err) => bail!(err),
         }
 
-        let sent = loop {
-            match server.socket.send_to(&self.send_buf[..], self.peer) {
-                Ok(sent) => break sent,
-                Err(ref err) if interrupted(err) => continue,
-                Err(ref err) if would_block(err) => {
-                    return Ok(SendStatus::WouldBlock);
-                }
-                Err(err) => bail!(err),
-            }
+        let n = match socket.send_to(&self.send_buf[..], self.peer) {
+            Ok(n) => n,
+            Err(ref err) if interrupted(err) => return self.drive_send(socket),
+            Err(ref err) if would_block(err) => return Ok(SendStatus::WouldBlock),
+            Err(err) => bail!(err),
         };
 
-        self.send_buf.drain(..sent);
-
+        self.send_buf.drain(..n);
         Ok(SendStatus::NotDone)
+    }
+
+    pub fn next_timeout(&self) -> Option<Instant> {
+        self.conn.timeout_instant()
     }
 
     pub fn on_timeout(&mut self) {
         self.conn.on_timeout();
     }
 
-    pub fn is_established(&self) -> bool {
-        self.conn.is_established()
+    pub fn peer(&self) -> SocketAddr {
+        self.peer
+    }
+
+    fn configure(&mut self) -> Result<()> {
+        if !self.is_server {
+            self.conn
+                .stream_priority(KEEPALIVE_STREAM, Priority::Critical as _, false)?;
+        }
+
+        Ok(())
+    }
+
+    fn recv_keepalive(&mut self) -> Result<bool> {
+        if self.conn.stream_readable(KEEPALIVE_STREAM) {
+            let buf = &mut [0; KEEPALIVE_MESSAGE.len()];
+            let (_, fin) = self.conn.stream_recv(KEEPALIVE_STREAM, buf)?;
+            assert!(!fin);
+            assert_eq!(&buf[..], KEEPALIVE_MESSAGE);
+            self.last_received_keepalive = Instant::now();
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
+
+    fn send_keepalive(&mut self) -> Result<()> {
+        let n = self
+            .conn
+            .stream_send(KEEPALIVE_STREAM, KEEPALIVE_MESSAGE, false)?;
+
+        assert_eq!(n, KEEPALIVE_MESSAGE.len());
+        self.last_sent_keepalive = Instant::now();
+        Ok(())
+    }
+
+    pub fn keepalive(&mut self) -> Result<bool> {
+        if !self.conn.is_established() {
+            return Ok(true);
+        }
+
+        // if server and not responding to keepalivee
+        if self.is_server {
+            if !self.recv_keepalive()? {
+                return Ok(self.last_received_keepalive.elapsed() < KEEPALIVE_TIMEOUT);
+            } else {
+                debug!("server sending keepalive response");
+            }
+        }
+
+        // if client and interval not reached, don't send keepalive
+        if !self.is_server {
+            if self.last_sent_keepalive.elapsed() < KEEPALIVE_INTERVAL {
+                return Ok(true);
+            } else {
+                debug!("client sending keepalive request");
+            }
+        }
+
+        self.send_keepalive()?;
+
+        if !self.is_server {
+            while self.recv_keepalive()? {
+                debug!("client received keepalive response");
+            }
+        }
+
+        Ok(true)
+    }
+
+    pub fn is_closed(&self) -> bool {
+        self.conn.is_closed()
+    }
+
+    pub fn close(&mut self) -> Result<bool> {
+        match self.conn.close(false, 1, b"") {
+            Ok(_) => Ok(false),
+            Err(quiche::Error::Done) => Ok(true),
+            Err(err) => bail!(err),
+        }
     }
 }
 
 pub enum SendStatus {
-    Done { timeout: Option<Duration> },
+    Done,
     NotDone,
     WouldBlock,
 }

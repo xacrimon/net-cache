@@ -7,3 +7,5 @@ edition = "2024"
 quiche = "0.23.4"
 anyhow = "1.0.97"
 tracing-subscriber = "0.3.19"
+transport = { path = "../transport" }
+mio = { version = "1.0.3", features = ["os-poll", "os-ext", "net"] }

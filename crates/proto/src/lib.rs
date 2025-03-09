@@ -1,8 +1,5 @@
-use anyhow::{Result, bail};
-use redis_protocol::resp2::{
-    decode::decode as decode_resp2,
-    types::{OwnedFrame, Resp2Frame},
-};
+use anyhow::Result;
+use redis_protocol::resp2::{decode::decode as decode_resp2, types::OwnedFrame};
 
 pub enum Request {}
 

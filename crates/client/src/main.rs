@@ -1,91 +1,73 @@
-use std::net::UdpSocket;
+use transport::{IOBUF_SIZE, SendStatus};
 
 use anyhow::Result;
-use quiche::ConnectionId;
 use tracing_subscriber::filter::LevelFilter;
+use transport::NeQuTransport;
 
 fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_max_level(LevelFilter::TRACE)
         .init();
 
-    let addr = "127.0.0.1:15981".parse()?;
-    let addr_server = "127.0.0.1:6479".parse()?;
-    let socket = UdpSocket::bind(addr)?;
+    let local = "127.0.0.1:15981".parse()?;
+    let peer = "127.0.0.1:6479".parse()?;
+    let socket = std::net::UdpSocket::bind(local)?;
     socket.set_nonblocking(false)?;
-    socket.set_read_timeout(Some(std::time::Duration::from_millis(1000)))?;
-    socket.connect(addr_server)?;
+    socket.set_read_timeout(Some(std::time::Duration::from_millis(100)))?;
 
-    let scid = ConnectionId::from_ref(&[1; 16]);
-    let mut config = quiche::Config::new(quiche::PROTOCOL_VERSION)?;
-    config.verify_peer(false);
-    config.set_application_protos(&[b"nequ/1.0"])?;
-    config.set_max_idle_timeout(1000);
+    let socket = mio::net::UdpSocket::from_std(socket);
+    let mut timeout = None;
 
-    let mut conn = quiche::connect(None, &scid, addr, addr_server, &mut config)?;
-
-    let mut recv_buf = Vec::new();
+    let scid = transport::connection_id_from_addrs(local, peer);
+    let mut transport = NeQuTransport::connect(local, peer, &scid)?;
 
     loop {
         loop {
-            let mut buf = vec![0; 100000];
-            match socket.recv(&mut buf) {
+            let mut buf = vec![0; IOBUF_SIZE];
+
+            let n = match socket.recv(&mut buf) {
                 Ok(0) => panic!("socket closed"),
-                Ok(n) => recv_buf.extend_from_slice(&buf[..n]),
+                Ok(n) => n,
                 Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
-                    println!("recv would block");
                     break;
                 }
                 Err(e) => {
                     panic!("recv failed: {:?}", e);
                 }
             };
+
+            transport.recv_packet(&buf[..n])?;
         }
 
-        if !recv_buf.is_empty() {
-            let info = quiche::RecvInfo {
-                from: addr_server,
-                to: addr,
-            };
+        transport.drive_recv()?;
 
-            match conn.recv(&mut recv_buf[..], info) {
-                Ok(read) => {
-                    println!("Got {} bytes.", read);
-                    recv_buf.drain(..read);
-                }
-                Err(e) => {
-                    panic!("Error while reading: {:?}", e);
-                }
+        match transport.keepalive() {
+            Ok(_) => {}
+            Err(e) => {
+                eprintln!("keepalive failed: {:?}", e);
+                eprintln!("backtrace: {:?}", e.backtrace());
+            }
+        }
+
+        if let Some(timeout) = timeout.take() {
+            let now = std::time::Instant::now();
+            if timeout <= now {
+                transport.on_timeout();
             }
         }
 
         loop {
-            let mut out = vec![0; 100000];
-
-            match conn.send(&mut out) {
-                Ok((write, _)) => {
-                    out.truncate(write);
-                    println!("Written {} bytes", write);
-                }
-                Err(quiche::Error::Done) => {
-                    println!("Done writing");
+            match transport.drive_send(&socket)? {
+                SendStatus::Done => {
+                    timeout = transport.next_timeout();
                     break;
                 }
-                Err(err) => {
-                    panic!("send failed: {:?}", err);
+                SendStatus::NotDone => {
+                    continue;
                 }
-            }
-
-            if !out.is_empty() {
-                dbg!(out.len());
-                match socket.send(&out) {
-                    Ok(sent) => {
-                        out.drain(..sent);
-                        println!("Sent {} bytes", sent);
-                    }
-                    Err(e) => {
-                        panic!("send failed: {:?}", e);
-                    }
+                SendStatus::WouldBlock => {
+                    println!("send would block");
+                    break;
                 }
             }
         }
