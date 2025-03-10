@@ -1,4 +1,4 @@
-use crate::ClientId;
+use crate::server::ClientId;
 use crate::ttl::{Tracker, TtlKey};
 use std::collections::HashMap;
 use std::hash::{BuildHasher, Hash, Hasher};

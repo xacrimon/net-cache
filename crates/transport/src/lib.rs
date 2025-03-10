@@ -91,12 +91,12 @@ pub fn interrupted_anyhow(err: &anyhow::Error) -> bool {
     err.downcast_ref::<io::Error>().map_or(false, interrupted)
 }
 
-pub struct NeQuServer {
+pub struct NeQuListener {
     config: quiche::Config,
     socket: UdpSocket,
 }
 
-impl NeQuServer {
+impl NeQuListener {
     pub fn bind(addr: SocketAddr) -> Result<Self> {
         let socket = UdpSocket::bind(addr)?;
         let config = quiche_server_config()?;
@@ -197,7 +197,7 @@ impl NeQuTransport {
     }
 
     pub fn readable_streams(&self) -> impl Iterator<Item = u64> {
-        self.conn.writable()
+        self.conn.readable()
     }
 
     pub fn writable_streams(&self) -> impl Iterator<Item = u64> {

@@ -1,6 +1,6 @@
 use std::time::Instant;
 
-use transport::{IOBUF_SIZE, SendStatus};
+use transport::IOBUF_SIZE;
 
 use anyhow::Result;
 use tracing_subscriber::filter::LevelFilter;
